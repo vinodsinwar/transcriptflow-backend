@@ -1,0 +1,21 @@
+# FastAPI and async dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+slowapi==0.1.9
+aioredis==2.0.1
+aiofiles==23.2.1
+
+# Existing dependencies
+youtube-transcript-api==1.2.1
+requests==2.32.4
+certifi>=2017.4.17
+urllib3<3,>=1.21.1
+charset_normalizer<4,>=2
+idna<4,>=2.5
+defusedxml
+
+# Monitoring and observability
+prometheus-client==0.19.0
+structlog==23.2.0
+
