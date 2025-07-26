@@ -28,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, origins=['https://iyqcoelo.manus.space', 'https://cblcaylk.manus.space', 'https://ssonrirb.manus.space', 'http://localhost:5173', 'http://localhost:5174', 'http://localhost:3000'], 
+CORS(app, origins=['https://transcriptflow.io', 'https://transcriptflow-frontend.pages.dev', 'https://iyqcoelo.manus.space', 'https://cblcaylk.manus.space', 'https://ssonrirb.manus.space', 'http://localhost:5173', 'http://localhost:5174', 'http://localhost:3000'], 
      methods=['GET', 'POST', 'OPTIONS'], 
      allow_headers=['Content-Type', 'Authorization'],
      supports_credentials=True)
