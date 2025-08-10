@@ -277,9 +277,10 @@ def try_proxy_rotation(video_id):
     for attempt in range(max_proxy_attempts):
         proxy, user_agent = proxy_rotator.get_next_proxy()
         
-        if not proxy:
-            logger.warning("No proxies available")
-            break
+        if proxy is None:
+            logger.info("Using direct connection (no proxy)")
+            # Skip proxy rotation and use direct connection
+            return try_direct_connection(video_id)
         
         proxy_index = proxy_rotator.current_index - 1
         start_time = time.time()
@@ -287,7 +288,8 @@ def try_proxy_rotation(video_id):
         try:
             # Create custom session with proxy and user agent
             session = requests.Session()
-            session.proxies.update(proxy)
+            if proxy:  # Only update proxies if proxy is not None
+                session.proxies.update(proxy)
             session.headers.update({
                 'User-Agent': user_agent,
                 'Accept-Language': 'en-US,en;q=0.9',
@@ -298,10 +300,11 @@ def try_proxy_rotation(video_id):
                 'Upgrade-Insecure-Requests': '1'
             })
             
-            # Test proxy connectivity first
-            test_response = session.get('https://httpbin.org/ip', timeout=10)
-            if test_response.status_code != 200:
-                raise Exception("Proxy connectivity test failed")
+            # Test proxy connectivity first (only if using proxy)
+            if proxy:
+                test_response = session.get('https://httpbin.org/ip', timeout=10)
+                if test_response.status_code != 200:
+                    raise Exception("Proxy connectivity test failed")
             
             # Try to get transcript using the proxy session
             # Note: youtube-transcript-api doesn't directly support custom sessions
