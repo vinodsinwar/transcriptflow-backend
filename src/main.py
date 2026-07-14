@@ -1,9 +1,14 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 import os
 import re
 import logging
+import threading
 import time
+from collections import OrderedDict
 from datetime import datetime
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
@@ -24,6 +29,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+# Trust Render's reverse proxy so rate limiting sees the real client IP
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    storage_uri='memory://',
+    headers_enabled=True,
+)
 
 ALLOWED_ORIGINS = [
     'https://transcriptflow.io',
@@ -59,6 +73,34 @@ def _proxy_config_from_env():
 
 PROXY_CONFIG = _proxy_config_from_env()
 
+# In-memory LRU transcript cache. Repeat requests for the same video are
+# served from here instead of re-fetching through the (paid) proxy.
+CACHE_MAX_ENTRIES = int(os.environ.get('TRANSCRIPT_CACHE_MAX', 500))
+CACHE_TTL_SECONDS = int(os.environ.get('TRANSCRIPT_CACHE_TTL', 24 * 3600))
+_cache = OrderedDict()
+_cache_lock = threading.Lock()
+
+
+def cache_get(video_id):
+    with _cache_lock:
+        entry = _cache.get(video_id)
+        if entry is None:
+            return None
+        stored_at, payload = entry
+        if time.time() - stored_at > CACHE_TTL_SECONDS:
+            del _cache[video_id]
+            return None
+        _cache.move_to_end(video_id)
+        return dict(payload)
+
+
+def cache_set(video_id, payload):
+    with _cache_lock:
+        _cache[video_id] = (time.time(), dict(payload))
+        _cache.move_to_end(video_id)
+        while len(_cache) > CACHE_MAX_ENTRIES:
+            _cache.popitem(last=False)
+
 
 def _fetch_transcript(video_id):
     """Fetch a transcript, preferring English, falling back to any available language.
@@ -91,6 +133,7 @@ def index():
     })
 
 @app.route('/api/transcript', methods=['POST'])
+@limiter.limit('10 per minute; 100 per hour')
 def get_transcript():
     """Generate transcript from YouTube URL"""
     start_time = time.time()
@@ -105,9 +148,8 @@ def get_transcript():
             }), 400
 
         video_url = data.get('video_url')
-        logger.info(f"Processing transcript request for URL: {video_url}")
 
-        # Extract video ID from URL
+        # Extract video ID from URL. Only the ID is logged, never the full URL.
         video_id_match = re.search(r'(?:v=|youtu\.be/|embed/|watch\?v=)([a-zA-Z0-9_-]{11})', video_url)
         if not video_id_match:
             return jsonify({
@@ -116,7 +158,16 @@ def get_transcript():
             }), 400
 
         video_id = video_id_match.group(1)
-        logger.info(f"Extracted video ID: {video_id}")
+        logger.info(f"Processing transcript request for video {video_id}")
+
+        # Serve repeat requests from cache to save proxy bandwidth
+        cached = cache_get(video_id)
+        if cached is not None:
+            cached['cached'] = True
+            cached['processing_time_ms'] = (time.time() - start_time) * 1000
+            cached['timestamp'] = datetime.utcnow().isoformat()
+            logger.info(f"Served video {video_id} from cache")
+            return jsonify(cached)
 
         # Get transcript using youtube-transcript-api
         try:
@@ -188,6 +239,7 @@ def get_transcript():
                 'success': True
             }
 
+            cache_set(video_id, response_data)
             logger.info(f"Successfully processed transcript for video {video_id} in {processing_time:.2f}ms")
             return jsonify(response_data)
 
@@ -220,6 +272,13 @@ def health_check():
     })
 
 # Error handlers
+@app.errorhandler(429)
+def rate_limit_handler(e):
+    return jsonify({
+        'error': 'Too many requests. Please wait a minute and try again.',
+        'error_type': 'rate_limited'
+    }), 429
+
 @app.errorhandler(404)
 def not_found_handler(e):
     return jsonify({
