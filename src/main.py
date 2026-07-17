@@ -319,21 +319,43 @@ def _build_docx(payload):
     return buf
 
 
+# Scripts that need extra fonts / text shaping in the PDF
+_DEVANAGARI_RE = re.compile(r'[ऀ-ॿ]')
+_ARABIC_RE = re.compile(r'[؀-ۿݐ-ݿࢠ-ࣿ]')
+_COMPLEX_RE = re.compile(r'[֐-ࣿऀ-෿฀-໿ក-៿]')
+
+# fontTools logs every subsetting step at INFO — silence it
+logging.getLogger('fontTools').setLevel(logging.WARNING)
+
+
 def _build_pdf(payload):
-    """Build a PDF of the transcript in memory, with multilingual font fallback."""
+    """Build a PDF of the transcript in memory.
+
+    Fast path for Latin-script transcripts (2 fonts, no shaping engine);
+    extra fonts + HarfBuzz shaping only when the text actually needs them.
+    """
     from fpdf import FPDF
 
+    text_sample = f"{payload.get('video_title') or ''}\n{payload.get('transcript') or ''}"
     pdf = FPDF()
     pdf.add_font('NotoSans', '', os.path.join(FONT_DIR, 'NotoSans-Regular.ttf'))
     pdf.add_font('NotoSans', 'B', os.path.join(FONT_DIR, 'NotoSans-Bold.ttf'))
-    pdf.add_font('NotoDeva', '', os.path.join(FONT_DIR, 'NotoSansDevanagari-Regular.ttf'))
-    pdf.add_font('NotoArab', '', os.path.join(FONT_DIR, 'NotoSansArabic-Regular.ttf'))
-    pdf.set_fallback_fonts(['NotoDeva', 'NotoArab'])
-    try:
-        # Proper shaping/BiDi for Arabic and Indic scripts (needs uharfbuzz)
-        pdf.set_text_shaping(True)
-    except Exception:
-        pass
+
+    fallbacks = []
+    if _DEVANAGARI_RE.search(text_sample):
+        pdf.add_font('NotoDeva', '', os.path.join(FONT_DIR, 'NotoSansDevanagari-Regular.ttf'))
+        fallbacks.append('NotoDeva')
+    if _ARABIC_RE.search(text_sample):
+        pdf.add_font('NotoArab', '', os.path.join(FONT_DIR, 'NotoSansArabic-Regular.ttf'))
+        fallbacks.append('NotoArab')
+    if fallbacks:
+        pdf.set_fallback_fonts(fallbacks)
+    if _COMPLEX_RE.search(text_sample):
+        try:
+            # Proper shaping/BiDi for Arabic and Indic scripts (needs uharfbuzz)
+            pdf.set_text_shaping(True)
+        except Exception:
+            pass
 
     pdf.set_auto_page_break(True, margin=18)
     pdf.add_page()
@@ -477,13 +499,21 @@ def export_transcript():
             }), 500
 
         mimetype, builder = EXPORT_FORMATS[export_format]
+        filename = f"{_slugify(payload.get('video_title') or video_id)}.{export_format}"
+
+        # Generated files are cached so repeat downloads are instant
+        file_cache_key = f"export:{video_id}:{target_language or 'default'}:{export_format}"
+        cached_file = cache_get(file_cache_key)
+        if cached_file is not None:
+            return send_file(io.BytesIO(cached_file['bytes']), mimetype=mimetype,
+                             as_attachment=True, download_name=filename)
+
         if builder is None:
             buf = io.BytesIO((payload.get('transcript') or '').encode('utf-8'))
         else:
             buf = builder(payload)
         buf.seek(0)
-
-        filename = f"{_slugify(payload.get('video_title') or video_id)}.{export_format}"
+        cache_set(file_cache_key, {'bytes': buf.getvalue()})
         return send_file(buf, mimetype=mimetype, as_attachment=True, download_name=filename)
 
     except Exception as e:
