@@ -246,6 +246,7 @@ def _transcript_payload(video_id, target_language=None):
         'success': True
     }
     cache_set(cache_key, payload)
+    _increment_transcript_counter()
     logger.info(f"Fetched and cached transcript for video {video_id} ({target_language or 'default'})")
     return payload, False
 
@@ -601,6 +602,41 @@ def check_and_consume_quota(license_key, n_videos):
         'day_used': day_used, 'day_limit': PRO_DAILY_VIDEO_QUOTA,
         'month_used': month_used, 'month_limit': PRO_MONTHLY_VIDEO_QUOTA,
     }
+
+
+# Real transcript counter — the honest number shown on the site.
+STATS_BASELINE = int(os.environ.get('STATS_BASELINE', 0))
+_stats_mem = {'transcripts': 0}
+
+
+def _increment_transcript_counter():
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            _upstash(['INCR', 'stats:transcripts'])
+            return
+        except Exception:
+            pass
+    with _quota_lock:
+        _stats_mem['transcripts'] += 1
+
+
+def _get_transcript_count():
+    count = None
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            result = _upstash(['GET', 'stats:transcripts'])
+            count = int(result[0]['result'] or 0)
+        except Exception:
+            pass
+    if count is None:
+        count = _stats_mem['transcripts']
+    return STATS_BASELINE + count
+
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Public, real usage stats (no fabricated numbers on the site)."""
+    return jsonify({'transcripts_total': _get_transcript_count(), 'success': True})
 
 
 @app.route('/api/playlist', methods=['POST'])
