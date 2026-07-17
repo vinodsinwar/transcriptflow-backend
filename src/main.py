@@ -874,21 +874,24 @@ def export_playlist_combined():
                     'error_type': 'license_required'
                 }), 402
 
+        # Per-video transcript length cap: real transcripts run ~10-100k chars even for
+        # multi-hour videos; the cap stops abuse of this endpoint as a free PDF builder.
+        max_chars = int(os.environ.get('COMBINED_EXPORT_MAX_CHARS_PER_VIDEO', 400_000))
         cleaned = []
         for v in videos[:PRO_MAX_PLAYLIST_VIDEOS]:
-            if not isinstance(v, dict) or not (v.get('transcript') or '').strip():
+            if not isinstance(v, dict) or not isinstance(v.get('transcript'), str) or not v['transcript'].strip():
                 continue
             cleaned.append({
-                'video_id': re.sub(r'[^a-zA-Z0-9_-]', '', (v.get('video_id') or ''))[:11],
-                'title': (v.get('title') or '')[:300],
-                'transcript': v.get('transcript') or '',
-                'language': (v.get('language') or '')[:20],
+                'video_id': re.sub(r'[^a-zA-Z0-9_-]', '', str(v.get('video_id') or ''))[:11],
+                'title': str(v.get('title') or '')[:300],
+                'transcript': v['transcript'][:max_chars],
+                'language': str(v.get('language') or '')[:20],
                 'word_count': v.get('word_count') if isinstance(v.get('word_count'), int) else None,
             })
         if not cleaned:
             return jsonify({'error': 'No valid transcripts provided.', 'error_type': 'invalid_input'}), 400
 
-        playlist_title = (data.get('playlist_title') or 'YouTube Playlist Transcript')[:300]
+        playlist_title = str(data.get('playlist_title') or 'YouTube Playlist Transcript')[:300]
         mimetype, builder = COMBINED_EXPORT_FORMATS[export_format]
         buf = builder(playlist_title, cleaned)
         buf.seek(0)
