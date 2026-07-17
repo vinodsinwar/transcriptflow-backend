@@ -4,6 +4,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
 import io
+import json
 import os
 import re
 import logging
@@ -384,6 +385,324 @@ EXPORT_FORMATS = {
     'docx': ('application/vnd.openxmlformats-officedocument.wordprocessingml.document', _build_docx),
     'pdf': ('application/pdf', _build_pdf),
 }
+
+
+# ---------------------------------------------------------------------------
+# Playlist support (TranscriptFlow Pro)
+# ---------------------------------------------------------------------------
+
+PLAYLIST_ID_RE = re.compile(r'[?&]list=([a-zA-Z0-9_-]{10,})')
+FREE_PLAYLIST_VIDEOS = int(os.environ.get('FREE_PLAYLIST_VIDEOS', 2))
+PRO_MAX_PLAYLIST_VIDEOS = int(os.environ.get('PRO_MAX_PLAYLIST_VIDEOS', 100))
+PRO_DAILY_VIDEO_QUOTA = int(os.environ.get('PRO_DAILY_VIDEO_QUOTA', 200))
+PRO_MONTHLY_VIDEO_QUOTA = int(os.environ.get('PRO_MONTHLY_VIDEO_QUOTA', 1000))
+DODO_API_BASE = os.environ.get('DODO_API_BASE', 'https://live.dodopayments.com')
+
+
+def _playlist_id_from_url(url):
+    match = PLAYLIST_ID_RE.search(url or '')
+    return match.group(1) if match else None
+
+
+def _fetch_playlist(playlist_id):
+    """Fetch playlist metadata + first ~100 videos via YouTube's InnerTube API
+    (through the proxy). Returns {'title': str, 'videos': [{video_id,title,duration}]}"""
+    proxies = PROXY_CONFIG.to_requests_dict() if PROXY_CONFIG else None
+    last_exc = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                'https://www.youtube.com/youtubei/v1/browse',
+                json={
+                    'context': {'client': {'clientName': 'WEB', 'clientVersion': '2.20240101.00.00'}},
+                    'browseId': f'VL{playlist_id}',
+                },
+                proxies=proxies,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as e:
+            last_exc = e
+            logger.warning(f"Playlist fetch attempt {attempt + 1}/3 failed: {type(e).__name__}")
+    else:
+        raise last_exc
+
+    title = None
+    try:
+        title = data['metadata']['playlistMetadataRenderer']['title']
+    except Exception:
+        try:
+            title = data['header']['playlistHeaderRenderer']['title']['simpleText']
+        except Exception:
+            pass
+
+    def _duration_to_seconds(text):
+        try:
+            parts = [int(p) for p in text.split(':')]
+            seconds = 0
+            for part in parts:
+                seconds = seconds * 60 + part
+            return seconds
+        except Exception:
+            return 0
+
+    videos = []
+    seen = set()
+
+    def _collect(node):
+        if len(videos) >= PRO_MAX_PLAYLIST_VIDEOS:
+            return
+        if isinstance(node, dict):
+            # Current YouTube web structure (2025+): lockupViewModel entries
+            lockup = node.get('lockupViewModel')
+            if lockup and lockup.get('contentType') == 'LOCKUP_CONTENT_TYPE_VIDEO':
+                video_id = lockup.get('contentId')
+                if video_id and re.fullmatch(r'[a-zA-Z0-9_-]{11}', video_id) and video_id not in seen:
+                    seen.add(video_id)
+                    video_title = (lockup.get('metadata', {})
+                                   .get('lockupMetadataViewModel', {})
+                                   .get('title', {}) or {}).get('content') or video_id
+                    duration_match = re.search(r'"text":\s*"(\d+(?::\d{2})+)"', json.dumps(lockup.get('contentImage', {})))
+                    videos.append({
+                        'video_id': video_id,
+                        'title': video_title,
+                        'duration_seconds': _duration_to_seconds(duration_match.group(1)) if duration_match else 0,
+                        'playable': True,
+                    })
+                return
+            # Legacy structure: playlistVideoRenderer entries
+            renderer = node.get('playlistVideoRenderer')
+            if renderer:
+                video_id = renderer.get('videoId')
+                if video_id and video_id not in seen:
+                    seen.add(video_id)
+                    try:
+                        video_title = ''.join(run.get('text', '') for run in renderer['title'].get('runs', []))
+                    except Exception:
+                        video_title = video_id
+                    videos.append({
+                        'video_id': video_id,
+                        'title': video_title,
+                        'duration_seconds': int(renderer.get('lengthSeconds', 0) or 0),
+                        'playable': renderer.get('isPlayable', True),
+                    })
+                return
+            for value in node.values():
+                _collect(value)
+        elif isinstance(node, list):
+            for item in node:
+                _collect(item)
+
+    _collect(data.get('contents', {}))
+
+    if not videos:
+        raise ValueError('empty playlist')
+    return {'title': title or 'YouTube Playlist', 'videos': videos}
+
+
+def _validate_license(license_key):
+    """Validate a license key against Dodo Payments' public validation endpoint.
+    Results are cached briefly to avoid hammering the API during bulk exports."""
+    if not license_key or len(license_key) > 200:
+        return False
+    cache_key = f"license:{license_key}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached['valid']
+    valid = False
+    try:
+        resp = requests.post(
+            f'{DODO_API_BASE}/licenses/validate',
+            json={'license_key': license_key},
+            timeout=8,
+        )
+        if resp.ok:
+            valid = bool(resp.json().get('valid'))
+    except Exception as e:
+        logger.warning(f"License validation error: {type(e).__name__}")
+    _cache_short(cache_key, {'valid': valid}, ttl=600)
+    return valid
+
+
+# Short-TTL cache entries piggyback on the main LRU with their own expiry
+def _cache_short(key, payload, ttl):
+    payload = dict(payload)
+    payload['_expires_at'] = time.time() + ttl
+    cache_set(key, payload)
+
+
+_orig_cache_get = cache_get
+
+
+def cache_get(key):  # noqa: F811 - wrap to honor short TTLs
+    entry = _orig_cache_get(key)
+    if entry and '_expires_at' in entry and time.time() > entry['_expires_at']:
+        return None
+    return entry
+
+
+# Per-license usage counters. Upstash Redis (free tier) when configured so
+# quotas survive restarts; otherwise in-memory.
+UPSTASH_URL = os.environ.get('UPSTASH_REDIS_REST_URL')
+UPSTASH_TOKEN = os.environ.get('UPSTASH_REDIS_REST_TOKEN')
+_quota_mem = {}
+_quota_lock = threading.Lock()
+
+
+def _quota_periods():
+    now = time.gmtime()
+    return time.strftime('%Y%m%d', now), time.strftime('%Y%m', now)
+
+
+def _upstash(*command):
+    resp = requests.post(
+        f'{UPSTASH_URL}/pipeline',
+        headers={'Authorization': f'Bearer {UPSTASH_TOKEN}'},
+        json=[list(command)] if isinstance(command[0], str) else [list(c) for c in command],
+        timeout=8,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def check_and_consume_quota(license_key, n_videos):
+    """Reserve n_videos against the license's daily/monthly quota.
+    Returns (allowed: bool, info: dict)."""
+    day, month = _quota_periods()
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            result = _upstash(
+                ['INCRBY', f'q:d:{day}:{license_key}', str(n_videos)],
+                ['EXPIRE', f'q:d:{day}:{license_key}', '90000'],
+                ['INCRBY', f'q:m:{month}:{license_key}', str(n_videos)],
+                ['EXPIRE', f'q:m:{month}:{license_key}', '2764800'],
+            )
+            day_used = int(result[0]['result'])
+            month_used = int(result[2]['result'])
+        except Exception as e:
+            logger.warning(f"Upstash quota error, falling back to memory: {type(e).__name__}")
+            day_used = month_used = None
+    else:
+        day_used = month_used = None
+
+    if day_used is None:
+        with _quota_lock:
+            rec = _quota_mem.setdefault(license_key, {})
+            rec[f'd:{day}'] = rec.get(f'd:{day}', 0) + n_videos
+            rec[f'm:{month}'] = rec.get(f'm:{month}', 0) + n_videos
+            for k in [k for k in rec if not (k.endswith(day) or k.endswith(month))]:
+                del rec[k]
+            day_used, month_used = rec[f'd:{day}'], rec[f'm:{month}']
+
+    allowed = day_used <= PRO_DAILY_VIDEO_QUOTA and month_used <= PRO_MONTHLY_VIDEO_QUOTA
+    return allowed, {
+        'day_used': day_used, 'day_limit': PRO_DAILY_VIDEO_QUOTA,
+        'month_used': month_used, 'month_limit': PRO_MONTHLY_VIDEO_QUOTA,
+    }
+
+
+@app.route('/api/playlist', methods=['POST'])
+@limiter.limit('10 per minute; 60 per hour')
+def get_playlist():
+    """List a playlist's videos and which ones are unlocked for this user."""
+    try:
+        data = request.get_json() or {}
+        playlist_id = _playlist_id_from_url(data.get('playlist_url'))
+        if not playlist_id:
+            return jsonify({
+                'error': 'Invalid playlist URL. Paste a YouTube playlist link containing "list=".',
+                'error_type': 'invalid_url'
+            }), 400
+
+        licensed = _validate_license((data.get('license_key') or '').strip())
+
+        cache_key = f"playlist:{playlist_id}"
+        playlist = cache_get(cache_key)
+        if playlist is None:
+            try:
+                playlist = _fetch_playlist(playlist_id)
+            except ValueError:
+                return jsonify({
+                    'error': 'This playlist appears to be empty, private, or unavailable.',
+                    'error_type': 'playlist_unavailable'
+                }), 404
+            except Exception as e:
+                logger.error(f"Playlist fetch failed for {playlist_id}: {type(e).__name__}")
+                return jsonify({
+                    'error': 'Could not load this playlist right now. Please try again.',
+                    'error_type': 'fetch_error'
+                }), 502
+            cache_set(cache_key, playlist)
+
+        videos = playlist['videos']
+        playable_ids = [v['video_id'] for v in videos if v.get('playable', True)]
+        unlocked = playable_ids if licensed else playable_ids[:FREE_PLAYLIST_VIDEOS]
+
+        return jsonify({
+            'playlist_id': playlist_id,
+            'title': playlist['title'],
+            'videos': videos,
+            'video_count': len(videos),
+            'unlocked_ids': unlocked,
+            'licensed': licensed,
+            'free_limit': FREE_PLAYLIST_VIDEOS,
+            'success': True,
+        })
+    except Exception as e:
+        logger.error(f"Unexpected error in get_playlist: {str(e)}")
+        return jsonify({
+            'error': 'An unexpected error occurred. Please try again later.',
+            'error_type': 'server_error'
+        }), 500
+
+
+@app.route('/api/playlist/transcript', methods=['POST'])
+@limiter.limit('60 per minute')
+def playlist_transcript():
+    """Fetch one transcript as part of a licensed playlist export (quota-metered).
+    Free-tier videos go through the normal /api/transcript endpoint."""
+    try:
+        data = request.get_json() or {}
+        video_id = _video_id_from_url(data.get('video_url')) or (
+            data.get('video_id') if re.fullmatch(r'[a-zA-Z0-9_-]{11}', data.get('video_id') or '') else None)
+        if not video_id:
+            return jsonify({'error': 'Invalid video reference.', 'error_type': 'invalid_url'}), 400
+
+        license_key = (data.get('license_key') or '').strip()
+        if not _validate_license(license_key):
+            return jsonify({
+                'error': 'A valid TranscriptFlow Pro license is required for playlist exports.',
+                'error_type': 'license_required'
+            }), 402
+
+        allowed, quota = check_and_consume_quota(license_key, 1)
+        if not allowed:
+            return jsonify({
+                'error': 'You have reached your Pro export quota. It resets daily/monthly.',
+                'error_type': 'quota_exceeded',
+                'quota': quota,
+            }), 429
+
+        try:
+            payload, was_cached = _transcript_payload(video_id, None)
+        except Exception as e:
+            error_response = _transcript_error_response(e, video_id)
+            if error_response:
+                return error_response
+            logger.error(f"Playlist transcript fetch error: {str(e)}")
+            return jsonify({'error': 'Failed to fetch transcript.', 'error_type': 'fetch_error'}), 500
+
+        payload['cached'] = was_cached
+        payload['quota'] = quota
+        return jsonify(payload)
+    except Exception as e:
+        logger.error(f"Unexpected error in playlist_transcript: {str(e)}")
+        return jsonify({
+            'error': 'An unexpected error occurred. Please try again later.',
+            'error_type': 'server_error'
+        }), 500
 
 
 @app.route('/')
