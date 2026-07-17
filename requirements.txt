@@ -9,3 +9,8 @@ urllib3<3,>=1.21.1
 charset_normalizer<4,>=2
 idna<4,>=2.5
 defusedxml
+
+# Document export
+python-docx>=1.1
+fpdf2>=2.8
+uharfbuzz>=0.39
