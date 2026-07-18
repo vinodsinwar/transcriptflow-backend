@@ -14,3 +14,4 @@ defusedxml
 python-docx>=1.1
 fpdf2>=2.8
 uharfbuzz>=0.39
+typst>=0.13,<1  # fast combined-playlist PDF (complex scripts ~50x faster than fpdf2)
