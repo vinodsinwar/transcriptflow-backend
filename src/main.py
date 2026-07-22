@@ -835,6 +835,106 @@ def get_stats():
     return jsonify({'transcripts_total': _get_transcript_count(), 'success': True})
 
 
+# ---------------------------------------------------------------------------
+# On-site tool ratings (honest AggregateRating source — real votes only)
+# ---------------------------------------------------------------------------
+
+RATEABLE_PAGES = {'home', 'playlist', 'translate', 'download'}
+_ratings_mem = {'seen': set(), 'sum': {}, 'cnt': {}}
+
+
+def _rating_ip_hash():
+    import hashlib
+    ip = get_remote_address() or 'unknown'
+    return hashlib.sha256(ip.encode()).hexdigest()[:24]
+
+
+@app.route('/api/rate', methods=['POST'])
+@limiter.limit('5 per minute')
+def rate_tool():
+    """Record a 1-5 star rating for a tool page. One vote per IP per page."""
+    try:
+        data = request.get_json() or {}
+        page = data.get('page')
+        rating = data.get('rating')
+        if page not in RATEABLE_PAGES or not isinstance(rating, int) or not 1 <= rating <= 5:
+            return jsonify({'error': 'Invalid rating.', 'error_type': 'invalid_input'}), 400
+
+        ip_hash = _rating_ip_hash()
+        counted = False
+        if UPSTASH_URL and UPSTASH_TOKEN:
+            try:
+                result = _upstash(
+                    ['SET', f'rate:seen:{page}:{ip_hash}', '1', 'NX', 'EX', '15552000'],  # 180 days
+                )
+                if result[0]['result'] == 'OK':
+                    _upstash(
+                        ['INCRBY', f'rate:sum:{page}', str(rating)],
+                        ['INCR', f'rate:cnt:{page}'],
+                    )
+                    counted = True
+            except Exception as e:
+                logger.warning(f"Upstash rating error, falling back to memory: {type(e).__name__}")
+                counted = None
+        else:
+            counted = None
+
+        if counted is None:  # in-memory fallback
+            with _quota_lock:
+                key = f'{page}:{ip_hash}'
+                if key not in _ratings_mem['seen']:
+                    _ratings_mem['seen'].add(key)
+                    _ratings_mem['sum'][page] = _ratings_mem['sum'].get(page, 0) + rating
+                    _ratings_mem['cnt'][page] = _ratings_mem['cnt'].get(page, 0) + 1
+                    counted = True
+                else:
+                    counted = False
+
+        return jsonify({'success': True, 'counted': counted})
+    except Exception as e:
+        logger.error(f"Unexpected error in rate_tool: {str(e)}")
+        return jsonify({'error': 'An unexpected error occurred.', 'error_type': 'server_error'}), 500
+
+
+@app.route('/api/ratings', methods=['GET'])
+@limiter.limit('30 per minute')
+def get_ratings():
+    """Live aggregate rating for a tool page — the number shown on the page IS the schema number."""
+    page = request.args.get('page')
+    if page not in RATEABLE_PAGES:
+        return jsonify({'error': 'Invalid page.', 'error_type': 'invalid_input'}), 400
+
+    cache_key = f'ratings:{page}'
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    total = count = 0
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            result = _upstash(['GET', f'rate:sum:{page}'], ['GET', f'rate:cnt:{page}'])
+            total = int(result[0]['result'] or 0)
+            count = int(result[1]['result'] or 0)
+        except Exception:
+            total = count = -1
+    else:
+        total = count = -1
+
+    if count == -1:  # in-memory fallback
+        with _quota_lock:
+            total = _ratings_mem['sum'].get(page, 0)
+            count = _ratings_mem['cnt'].get(page, 0)
+
+    payload = {
+        'page': page,
+        'average': round(total / count, 1) if count else 0,
+        'count': count,
+        'success': True,
+    }
+    _cache_short(cache_key, payload, ttl=60)
+    return jsonify(payload)
+
+
 @app.route('/api/playlist', methods=['POST'])
 @limiter.limit('10 per minute; 60 per hour')
 def get_playlist():
