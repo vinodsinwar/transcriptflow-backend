@@ -1522,7 +1522,9 @@ def v1_playlist():
 # ---------------------------------------------------------------------------
 
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
+# 'gemini-flash-latest' is Google's rolling alias for the current Flash model —
+# fixed model names (e.g. gemini-2.5-flash) get closed to new API keys over time.
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-flash-latest')
 SUMMARY_MONTHLY_QUOTA = int(os.environ.get('SUMMARY_MONTHLY_QUOTA', 150))
 _summary_mem = {}
 
@@ -1552,12 +1554,21 @@ def _gemini_summarize(prompt_text):
         params={'key': GEMINI_API_KEY},
         json={
             'contents': [{'parts': [{'text': prompt_text}]}],
-            'generationConfig': {'maxOutputTokens': 2048, 'temperature': 0.4},
+            # Generous cap: on "thinking" Flash models, reasoning tokens count
+            # against this budget before any visible output is produced.
+            'generationConfig': {'maxOutputTokens': 8192, 'temperature': 0.4},
         },
         timeout=90,
     )
     resp.raise_for_status()
-    return resp.json()['candidates'][0]['content']['parts'][0]['text']
+    data = resp.json()
+    candidates = data.get('candidates') or []
+    parts = (candidates[0].get('content') or {}).get('parts') if candidates else None
+    text = ''.join(p.get('text', '') for p in (parts or []) if isinstance(p, dict)).strip()
+    if not text:
+        reason = candidates[0].get('finishReason') if candidates else 'no candidates'
+        raise RuntimeError(f'empty Gemini response ({reason})')
+    return text
 
 
 @app.route('/api/summarize', methods=['POST'])
