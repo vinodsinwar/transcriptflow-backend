@@ -806,9 +806,100 @@ def _upstash(*command):
     return resp.json()
 
 
+# --- Course Pack credits (one-time purchases) --------------------------------
+# Pack keys are registered by the Dodo webhook (product_id -> credits mapping
+# via CREDIT_PACK_PRODUCTS env). Keys never registered default to subscription
+# behavior — the safe direction.
+CREDIT_PACK_PRODUCTS = {}
+try:
+    CREDIT_PACK_PRODUCTS = json.loads(os.environ.get('CREDIT_PACK_PRODUCTS', '{}'))
+except Exception:
+    logger.warning('CREDIT_PACK_PRODUCTS env is not valid JSON; ignoring')
+DODO_WEBHOOK_SECRET = os.environ.get('DODO_WEBHOOK_SECRET')
+
+_credits_mem = {'types': {}, 'bal': {}}
+
+
+def _key_type(license_key):
+    """'pack' or 'sub' for a valid license key. Cached briefly."""
+    cache_key = f'keytype:{license_key}'
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached['t']
+    ktype = None
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            result = _upstash(['GET', f'keytype:{license_key}'])
+            ktype = result[0]['result']
+        except Exception:
+            pass
+    if ktype is None:
+        ktype = _credits_mem['types'].get(license_key)
+    ktype = ktype or 'sub'
+    _cache_short(cache_key, {'t': ktype}, ttl=600)
+    return ktype
+
+
+def _register_pack_key(license_key, credits):
+    """Record a key as a Course Pack and seed its balance (idempotent)."""
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            _upstash(
+                ['SET', f'keytype:{license_key}', 'pack'],
+                ['SET', f'credits:bal:{license_key}', str(credits), 'NX'],
+                ['EXPIRE', f'credits:bal:{license_key}', '31536000'],  # 12 months
+                ['EXPIRE', f'keytype:{license_key}', '31536000'],
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Upstash pack registration failed: {type(e).__name__}")
+    with _quota_lock:
+        _credits_mem['types'][license_key] = 'pack'
+        _credits_mem['bal'].setdefault(license_key, credits)
+    return True
+
+
+def _consume_credits(license_key, n):
+    """Spend n credits from a pack balance. Returns (allowed, info)."""
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            result = _upstash(['DECRBY', f'credits:bal:{license_key}', str(n)])
+            remaining = int(result[0]['result'])
+            if remaining < 0:
+                _upstash(['INCRBY', f'credits:bal:{license_key}', str(n)])
+                return False, {'credits_remaining': max(0, remaining + n), 'plan': 'pack'}
+            return True, {'credits_remaining': remaining, 'plan': 'pack'}
+        except Exception as e:
+            logger.warning(f"Upstash credits error, falling back to memory: {type(e).__name__}")
+    with _quota_lock:
+        bal = _credits_mem['bal'].get(license_key, 0)
+        if bal < n:
+            return False, {'credits_remaining': bal, 'plan': 'pack'}
+        _credits_mem['bal'][license_key] = bal - n
+        return True, {'credits_remaining': bal - n, 'plan': 'pack'}
+
+
+def credits_remaining(license_key):
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            result = _upstash(['GET', f'credits:bal:{license_key}'])
+            return max(0, int(result[0]['result'] or 0))
+        except Exception:
+            pass
+    return _credits_mem['bal'].get(license_key, 0)
+
+
 def check_and_consume_quota(license_key, n_videos):
-    """Reserve n_videos against the license's daily/monthly quota.
+    """Reserve n_videos against the key's allowance.
+    Pack keys draw from a credit balance; subscription keys use daily/monthly quotas.
     Returns (allowed: bool, info: dict)."""
+    if _key_type(license_key) == 'pack':
+        return _consume_credits(license_key, n_videos)
+    return _consume_sub_quota(license_key, n_videos)
+
+
+def _consume_sub_quota(license_key, n_videos):
+    """Subscription path: daily/monthly quota windows."""
     day, month = _quota_periods()
     if UPSTASH_URL and UPSTASH_TOKEN:
         try:
@@ -889,6 +980,70 @@ def _rating_ip_hash():
     import hashlib
     ip = get_remote_address() or 'unknown'
     return hashlib.sha256(ip.encode()).hexdigest()[:24]
+
+
+@app.route('/api/webhooks/dodo', methods=['POST'])
+@limiter.exempt
+def dodo_webhook():
+    """Dodo Payments webhook (standard-webhooks spec). Used to register Course
+    Pack license keys: when a license key is created for a product listed in
+    CREDIT_PACK_PRODUCTS, the key is marked 'pack' and its balance seeded."""
+    import hmac as hmac_mod
+    import hashlib
+    import base64
+
+    if not DODO_WEBHOOK_SECRET:
+        return jsonify({'error': 'Webhook not configured.'}), 503
+
+    payload = request.get_data()
+    msg_id = request.headers.get('webhook-id', '')
+    timestamp = request.headers.get('webhook-timestamp', '')
+    signature_header = request.headers.get('webhook-signature', '')
+
+    try:
+        secret = DODO_WEBHOOK_SECRET
+        if secret.startswith('whsec_'):
+            secret = secret[6:]
+        signed = f'{msg_id}.{timestamp}.{payload.decode()}'.encode()
+        expected = base64.b64encode(
+            hmac_mod.new(base64.b64decode(secret), signed, hashlib.sha256).digest()
+        ).decode()
+        provided = [p.split(',', 1)[-1] for p in signature_header.split(' ') if p]
+        if not any(hmac_mod.compare_digest(expected, p) for p in provided):
+            return jsonify({'error': 'Invalid signature.'}), 401
+    except Exception:
+        return jsonify({'error': 'Invalid signature.'}), 401
+
+    try:
+        event = json.loads(payload)
+    except Exception:
+        return jsonify({'error': 'Invalid payload.'}), 400
+
+    # Walk the payload defensively: find a license key + product id wherever
+    # this event type nests them.
+    def _find(obj, names):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in names and isinstance(v, str) and v:
+                    return v
+                found = _find(v, names)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = _find(item, names)
+                if found:
+                    return found
+        return None
+
+    key = _find(event, {'key', 'license_key'})
+    product_id = _find(event, {'product_id'})
+    if key and product_id and str(product_id) in CREDIT_PACK_PRODUCTS:
+        credits = int(CREDIT_PACK_PRODUCTS[str(product_id)])
+        _register_pack_key(key, credits)
+        logger.info(f"Registered Course Pack key ({credits} credits) for product {product_id}")
+
+    return jsonify({'received': True})
 
 
 @app.route('/api/rate', methods=['POST'])
@@ -1018,7 +1173,7 @@ def get_playlist():
         playable_ids = [v['video_id'] for v in videos if v.get('playable', True)]
         unlocked = playable_ids if licensed else playable_ids[:FREE_PLAYLIST_VIDEOS]
 
-        return jsonify({
+        resp_body = {
             'playlist_id': playlist_id,
             'title': playlist['title'],
             'videos': videos,
@@ -1027,7 +1182,12 @@ def get_playlist():
             'licensed': licensed,
             'free_limit': FREE_PLAYLIST_VIDEOS,
             'success': True,
-        })
+        }
+        lic_key = (data.get('license_key') or '').strip()
+        if licensed and lic_key and _key_type(lic_key) == 'pack':
+            resp_body['plan'] = 'pack'
+            resp_body['credits_remaining'] = credits_remaining(lic_key)
+        return jsonify(resp_body)
     except Exception as e:
         logger.error(f"Unexpected error in get_playlist: {str(e)}")
         return jsonify({
@@ -1450,6 +1610,9 @@ def v1_transcript():
     if not key or not _validate_license(key):
         return jsonify({'error': 'Invalid or missing API key (use your Pro license key as a Bearer token).',
                         'error_type': 'unauthorized'}), 401
+    if _key_type(key) == 'pack':
+        return jsonify({'error': 'Course Pack keys do not include API access — upgrade to Pro for the developer API.',
+                        'error_type': 'forbidden'}), 403
 
     data = request.get_json() or {}
     video_id = _video_id_from_url(data.get('video_url')) or (
@@ -1629,10 +1792,17 @@ def summarize():
         else:
             return jsonify({'error': 'mode must be video or playlist.', 'error_type': 'invalid_input'}), 400
 
-        allowed, used = _consume_summary_quota(license_key)
-        if not allowed:
-            return jsonify({'error': f'Monthly AI summary limit reached ({SUMMARY_MONTHLY_QUOTA}).',
-                            'error_type': 'quota_exceeded'}), 429
+        if _key_type(license_key) == 'pack':
+            allowed, info = _consume_credits(license_key, 2)  # a summary costs 2 credits
+            if not allowed:
+                return jsonify({'error': f"Not enough credits for an AI summary (needs 2, you have {info['credits_remaining']}).",
+                                'error_type': 'quota_exceeded', 'credits_remaining': info['credits_remaining']}), 429
+            used = None
+        else:
+            allowed, used = _consume_summary_quota(license_key)
+            if not allowed:
+                return jsonify({'error': f'Monthly AI summary limit reached ({SUMMARY_MONTHLY_QUOTA}).',
+                                'error_type': 'quota_exceeded'}), 429
 
         try:
             summary_text = _gemini_summarize(prompt)
@@ -1641,8 +1811,10 @@ def summarize():
             return jsonify({'error': 'The AI service is unavailable right now. Please try again shortly.',
                             'error_type': 'ai_error'}), 502
 
-        result = {'summary': summary_text, 'mode': mode, 'model': GEMINI_MODEL,
-                  'summaries_used': used, 'summaries_limit': SUMMARY_MONTHLY_QUOTA, 'success': True}
+        result = {'summary': summary_text, 'mode': mode, 'model': GEMINI_MODEL, 'success': True}
+        if used is not None:
+            result['summaries_used'] = used
+            result['summaries_limit'] = SUMMARY_MONTHLY_QUOTA
         cache_set(cache_key, result)
         return jsonify(result)
     except Exception as e:
