@@ -242,6 +242,11 @@ def _transcript_payload(video_id, target_language=None):
         'duration': duration_seconds,
         'srt': srt_content,
         'vtt': vtt_content,
+        # Raw segments so clients can build structured formats (CSV/JSON/Markdown)
+        'segments': [
+            {'start': round(e['start'], 3), 'duration': round(e.get('duration', 0), 3), 'text': e['text']}
+            for e in transcript_data
+        ],
         'cached': False,
         'success': True
     }
@@ -601,6 +606,43 @@ def _playlist_id_from_url(url):
     return match.group(1) if match else None
 
 
+CHANNEL_ID_RE = re.compile(r'/channel/(UC[a-zA-Z0-9_-]{22})')
+CHANNEL_HANDLE_RE = re.compile(r'(?:youtube\.com)/(@[a-zA-Z0-9._-]{3,60}|c/[a-zA-Z0-9._-]{1,60}|user/[a-zA-Z0-9._-]{1,60})')
+
+
+def _channel_uploads_playlist(url):
+    """Resolve a channel URL to its uploads playlist ID (UU…), or None.
+
+    /channel/UC… is a direct string swap; @handles and /c/ /user/ names go
+    through InnerTube's navigation resolver (proxied like everything else).
+    """
+    m = CHANNEL_ID_RE.search(url or '')
+    if m:
+        return 'UU' + m.group(1)[2:]
+
+    m = CHANNEL_HANDLE_RE.search(url or '')
+    if not m:
+        return None
+    proxies = PROXY_CONFIG.to_requests_dict() if PROXY_CONFIG else None
+    try:
+        resp = requests.post(
+            'https://www.youtube.com/youtubei/v1/navigation/resolve_url',
+            json={
+                'context': {'client': {'clientName': 'WEB', 'clientVersion': '2.20240101.00.00'}},
+                'url': f'https://www.youtube.com/{m.group(1)}',
+            },
+            proxies=proxies,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        browse_id = (resp.json().get('endpoint', {}).get('browseEndpoint', {}) or {}).get('browseId', '')
+        if browse_id.startswith('UC') and len(browse_id) == 24:
+            return 'UU' + browse_id[2:]
+    except Exception as e:
+        logger.warning(f"Channel resolution failed: {type(e).__name__}")
+    return None
+
+
 def _fetch_playlist(playlist_id):
     """Fetch playlist metadata + first ~100 videos via YouTube's InnerTube API
     (through the proxy). Returns {'title': str, 'videos': [{video_id,title,duration}]}"""
@@ -941,10 +983,14 @@ def get_playlist():
     """List a playlist's videos and which ones are unlocked for this user."""
     try:
         data = request.get_json() or {}
-        playlist_id = _playlist_id_from_url(data.get('playlist_url'))
+        source_url = data.get('playlist_url')
+        playlist_id = _playlist_id_from_url(source_url)
+        if not playlist_id:
+            # Channel URLs resolve to the channel's uploads playlist
+            playlist_id = _channel_uploads_playlist(source_url)
         if not playlist_id:
             return jsonify({
-                'error': 'Invalid playlist URL. Paste a YouTube playlist link containing "list=".',
+                'error': 'Invalid URL. Paste a YouTube playlist link (contains "list=") or a channel URL (youtube.com/@name or /channel/UC…).',
                 'error_type': 'invalid_url'
             }), 400
 
@@ -1009,6 +1055,10 @@ def playlist_transcript():
                 'error_type': 'license_required'
             }), 402
 
+        target_language = (data.get('target_language') or '').strip() or None
+        if target_language and not re.fullmatch(r'[a-zA-Z-]{2,12}', target_language):
+            return jsonify({'error': 'Invalid target language code.', 'error_type': 'invalid_input'}), 400
+
         allowed, quota = check_and_consume_quota(license_key, 1)
         if not allowed:
             return jsonify({
@@ -1018,7 +1068,7 @@ def playlist_transcript():
             }), 429
 
         try:
-            payload, was_cached = _transcript_payload(video_id, None)
+            payload, was_cached = _transcript_payload(video_id, target_language)
         except Exception as e:
             error_response = _transcript_error_response(e, video_id)
             if error_response:
@@ -1069,20 +1119,8 @@ def export_playlist_combined():
                     'error_type': 'license_required'
                 }), 402
 
-        # Per-video transcript length cap: real transcripts run ~10-100k chars even for
-        # multi-hour videos; the cap stops abuse of this endpoint as a free PDF builder.
-        max_chars = int(os.environ.get('COMBINED_EXPORT_MAX_CHARS_PER_VIDEO', 400_000))
-        cleaned = []
-        for v in videos[:PRO_MAX_PLAYLIST_VIDEOS]:
-            if not isinstance(v, dict) or not isinstance(v.get('transcript'), str) or not v['transcript'].strip():
-                continue
-            cleaned.append({
-                'video_id': re.sub(r'[^a-zA-Z0-9_-]', '', str(v.get('video_id') or ''))[:11],
-                'title': str(v.get('title') or '')[:300],
-                'transcript': v['transcript'][:max_chars],
-                'language': str(v.get('language') or '')[:20],
-                'word_count': v.get('word_count') if isinstance(v.get('word_count'), int) else None,
-            })
+        # Per-video length cap + type coercion (shared with export-docs)
+        cleaned = _clean_export_videos(videos)
         if not cleaned:
             return jsonify({'error': 'No valid transcripts provided.', 'error_type': 'invalid_input'}), 400
 
@@ -1101,13 +1139,90 @@ def export_playlist_combined():
         }), 500
 
 
+def _clean_export_videos(videos):
+    """Shared validation/coercion for client-supplied transcript lists."""
+    max_chars = int(os.environ.get('COMBINED_EXPORT_MAX_CHARS_PER_VIDEO', 400_000))
+    cleaned = []
+    for v in videos[:PRO_MAX_PLAYLIST_VIDEOS]:
+        if not isinstance(v, dict) or not isinstance(v.get('transcript'), str) or not v['transcript'].strip():
+            continue
+        cleaned.append({
+            'video_id': re.sub(r'[^a-zA-Z0-9_-]', '', str(v.get('video_id') or ''))[:11],
+            'title': str(v.get('title') or '')[:300],
+            'transcript': v['transcript'][:max_chars],
+            'language': str(v.get('language') or '')[:20],
+            'word_count': v.get('word_count') if isinstance(v.get('word_count'), int) else None,
+        })
+    return cleaned
+
+
+@app.route('/api/playlist/export-docs', methods=['POST'])
+@limiter.limit('5 per minute; 20 per hour')
+def export_playlist_docs():
+    """One PDF or Word document PER VIDEO, zipped server-side.
+    Formatting only — the browser sends transcripts it already fetched."""
+    import zipfile
+
+    try:
+        data = request.get_json() or {}
+        export_format = (data.get('format') or '').lower().strip()
+        if export_format not in ('pdf', 'docx'):
+            return jsonify({'error': 'Invalid format. Supported: pdf, docx.', 'error_type': 'invalid_input'}), 400
+
+        videos = data.get('videos') or []
+        if not isinstance(videos, list) or not videos:
+            return jsonify({'error': 'No transcripts provided.', 'error_type': 'invalid_input'}), 400
+        if len(videos) > PRO_MAX_PLAYLIST_VIDEOS:
+            return jsonify({
+                'error': f'Too many videos in one export (max {PRO_MAX_PLAYLIST_VIDEOS}).',
+                'error_type': 'invalid_input'
+            }), 400
+        if len(videos) > FREE_PLAYLIST_VIDEOS:
+            license_key = (data.get('license_key') or '').strip()
+            if not _validate_license(license_key):
+                return jsonify({
+                    'error': f'A valid TranscriptFlow Pro license is required for more than {FREE_PLAYLIST_VIDEOS} videos.',
+                    'error_type': 'license_required'
+                }), 402
+
+        cleaned = _clean_export_videos(videos)
+        if not cleaned:
+            return jsonify({'error': 'No valid transcripts provided.', 'error_type': 'invalid_input'}), 400
+
+        builder = _build_pdf if export_format == 'pdf' else _build_docx
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for i, v in enumerate(cleaned):
+                doc_payload = {
+                    'video_title': v['title'] or v['video_id'],
+                    'transcript': v['transcript'],
+                    'language': v['language'] or '?',
+                    'video_id': v['video_id'],
+                    'word_count': v['word_count'],
+                }
+                buf = builder(doc_payload)
+                buf.seek(0)
+                zf.writestr(f"{i + 1:02d}-{_slugify(v['title'] or v['video_id'])}.{export_format}", buf.getvalue())
+        zip_buf.seek(0)
+
+        playlist_title = str(data.get('playlist_title') or 'playlist')[:300]
+        return send_file(zip_buf, mimetype='application/zip', as_attachment=True,
+                         download_name=f"{_slugify(playlist_title)}-{export_format}s.zip")
+    except Exception as e:
+        logger.error(f"Unexpected error in export_playlist_docs: {str(e)}")
+        return jsonify({
+            'error': 'An unexpected error occurred. Please try again later.',
+            'error_type': 'server_error'
+        }), 500
+
+
 @app.route('/')
 def index():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'message': 'TranscriptFlow Backend v3.4 is running',
-        'version': '3.4.0',
+        'message': 'TranscriptFlow Backend v3.5 is running',
+        'version': '3.5.0',
         'proxy': 'configured' if PROXY_CONFIG else 'none',
         'timestamp': datetime.utcnow().isoformat()
     })
@@ -1306,14 +1421,223 @@ def health_check():
     """Detailed health check"""
     return jsonify({
         'status': 'healthy',
-        'message': 'TranscriptFlow Backend v3.4 is running',
-        'version': '3.4.0',
+        'message': 'TranscriptFlow Backend v3.5 is running',
+        'version': '3.5.0',
         'timestamp': datetime.utcnow().isoformat(),
         'endpoints': [
             '/api/transcript (POST)',
             '/api/health (GET)'
         ]
     })
+
+# ---------------------------------------------------------------------------
+# Developer API (v1) — the Pro license key doubles as the API key
+# ---------------------------------------------------------------------------
+
+def _api_key_from_request():
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer '):
+        return auth[7:].strip()
+    return None
+
+
+@app.route('/v1/transcript', methods=['POST'])
+@limiter.limit('60 per minute')
+def v1_transcript():
+    """Developer API: fetch one video's transcript. Auth: Bearer <license key>.
+    Consumes 1 video from the key's Pro quota."""
+    key = _api_key_from_request()
+    if not key or not _validate_license(key):
+        return jsonify({'error': 'Invalid or missing API key (use your Pro license key as a Bearer token).',
+                        'error_type': 'unauthorized'}), 401
+
+    data = request.get_json() or {}
+    video_id = _video_id_from_url(data.get('video_url')) or (
+        data.get('video_id') if re.fullmatch(r'[a-zA-Z0-9_-]{11}', data.get('video_id') or '') else None)
+    if not video_id:
+        return jsonify({'error': 'Provide video_url or video_id.', 'error_type': 'invalid_input'}), 400
+
+    target_language = (data.get('target_language') or '').strip() or None
+    if target_language and not re.fullmatch(r'[a-zA-Z-]{2,12}', target_language):
+        return jsonify({'error': 'Invalid target_language.', 'error_type': 'invalid_input'}), 400
+
+    allowed, quota = check_and_consume_quota(key, 1)
+    if not allowed:
+        return jsonify({'error': 'Quota exceeded (resets daily/monthly).',
+                        'error_type': 'quota_exceeded', 'quota': quota}), 429
+
+    try:
+        payload, was_cached = _transcript_payload(video_id, target_language)
+    except Exception as e:
+        error_response = _transcript_error_response(e, video_id)
+        if error_response:
+            return error_response
+        logger.error(f"v1 transcript error: {str(e)}")
+        return jsonify({'error': 'Failed to fetch transcript.', 'error_type': 'fetch_error'}), 500
+
+    payload = dict(payload)
+    payload['cached'] = was_cached
+    payload['quota'] = quota
+    resp = jsonify(payload)
+    resp.headers['X-Quota-Day'] = f"{quota['day_used']}/{quota['day_limit']}"
+    resp.headers['X-Quota-Month'] = f"{quota['month_used']}/{quota['month_limit']}"
+    return resp
+
+
+@app.route('/v1/playlist', methods=['POST'])
+@limiter.limit('30 per minute')
+def v1_playlist():
+    """Developer API: list a playlist's or channel's videos (no quota cost)."""
+    key = _api_key_from_request()
+    if not key or not _validate_license(key):
+        return jsonify({'error': 'Invalid or missing API key (use your Pro license key as a Bearer token).',
+                        'error_type': 'unauthorized'}), 401
+
+    data = request.get_json() or {}
+    source_url = data.get('playlist_url') or data.get('channel_url')
+    playlist_id = _playlist_id_from_url(source_url) or _channel_uploads_playlist(source_url)
+    if not playlist_id:
+        return jsonify({'error': 'Provide playlist_url (contains list=) or channel_url.',
+                        'error_type': 'invalid_url'}), 400
+
+    cache_key = f"playlist:{playlist_id}"
+    playlist = cache_get(cache_key)
+    if playlist is None:
+        try:
+            playlist = _fetch_playlist(playlist_id)
+        except ValueError:
+            return jsonify({'error': 'Playlist empty, private, or unavailable.',
+                            'error_type': 'playlist_unavailable'}), 404
+        except Exception as e:
+            logger.error(f"v1 playlist fetch failed: {type(e).__name__}")
+            return jsonify({'error': 'Could not load this playlist.', 'error_type': 'fetch_error'}), 502
+        cache_set(cache_key, playlist)
+
+    return jsonify({'playlist_id': playlist_id, 'title': playlist['title'],
+                    'videos': playlist['videos'], 'video_count': len(playlist['videos']), 'success': True})
+
+
+# ---------------------------------------------------------------------------
+# AI summaries (Pro) — Gemini, model configurable via env
+# ---------------------------------------------------------------------------
+
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
+SUMMARY_MONTHLY_QUOTA = int(os.environ.get('SUMMARY_MONTHLY_QUOTA', 150))
+_summary_mem = {}
+
+
+def _consume_summary_quota(license_key):
+    """Count one summary against the key's monthly allowance. Returns (allowed, used)."""
+    _, month = _quota_periods()
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            result = _upstash(
+                ['INCR', f'sum:m:{month}:{license_key}'],
+                ['EXPIRE', f'sum:m:{month}:{license_key}', '2764800'],
+            )
+            used = int(result[0]['result'])
+            return used <= SUMMARY_MONTHLY_QUOTA, used
+        except Exception:
+            pass
+    with _quota_lock:
+        k = f'{month}:{license_key}'
+        _summary_mem[k] = _summary_mem.get(k, 0) + 1
+        return _summary_mem[k] <= SUMMARY_MONTHLY_QUOTA, _summary_mem[k]
+
+
+def _gemini_summarize(prompt_text):
+    resp = requests.post(
+        f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent',
+        params={'key': GEMINI_API_KEY},
+        json={
+            'contents': [{'parts': [{'text': prompt_text}]}],
+            'generationConfig': {'maxOutputTokens': 2048, 'temperature': 0.4},
+        },
+        timeout=90,
+    )
+    resp.raise_for_status()
+    return resp.json()['candidates'][0]['content']['parts'][0]['text']
+
+
+@app.route('/api/summarize', methods=['POST'])
+@limiter.limit('10 per minute')
+def summarize():
+    """AI summary of a single transcript or a whole playlist (Pro feature)."""
+    try:
+        if not GEMINI_API_KEY:
+            return jsonify({'error': 'AI summaries are not enabled on this server yet.',
+                            'error_type': 'not_configured'}), 503
+
+        data = request.get_json() or {}
+        license_key = (data.get('license_key') or '').strip()
+        if not _validate_license(license_key):
+            return jsonify({'error': 'A valid TranscriptFlow Pro license is required for AI summaries.',
+                            'error_type': 'license_required'}), 402
+
+        mode = data.get('mode') or 'video'
+        if mode == 'video':
+            video_id = _video_id_from_url(data.get('video_url'))
+            if not video_id:
+                return jsonify({'error': 'Provide video_url.', 'error_type': 'invalid_input'}), 400
+            cache_key = f'summary:video:{video_id}'
+            cached = cache_get(cache_key)
+            if cached is not None:
+                return jsonify(cached)
+            payload, _ = _transcript_payload(video_id, None)
+            source_text = (payload.get('transcript') or '')[:120_000]
+            title = payload.get('video_title') or video_id
+            prompt = (
+                f'Summarize this YouTube video transcript ("{title}").\n'
+                'Format: 2-3 sentence overview, then "Key points" as bullets, then '
+                '"Takeaways" as bullets. Keep [MM:SS] timestamp references where helpful. '
+                'Answer in the transcript\'s language.\n\n--- TRANSCRIPT ---\n' + source_text
+            )
+        elif mode == 'playlist':
+            videos = _clean_export_videos(data.get('videos') or [])
+            if not videos:
+                return jsonify({'error': 'Provide videos with transcripts.', 'error_type': 'invalid_input'}), 400
+            playlist_title = str(data.get('playlist_title') or 'YouTube playlist')[:300]
+            import hashlib
+            digest = hashlib.sha1(''.join(v['video_id'] for v in videos).encode()).hexdigest()[:16]
+            cache_key = f'summary:playlist:{digest}'
+            cached = cache_get(cache_key)
+            if cached is not None:
+                return jsonify(cached)
+            per_video_budget = max(4_000, 280_000 // max(len(videos), 1))
+            joined = '\n\n'.join(
+                f"### {i + 1}. {v['title']}\n{v['transcript'][:per_video_budget]}"
+                for i, v in enumerate(videos)
+            )
+            prompt = (
+                f'Below are transcripts of the {len(videos)}-video YouTube playlist "{playlist_title}".\n'
+                'Write: a 3-4 sentence series overview, then "What each video covers" (one line per video), '
+                'then "Key themes & takeaways" as bullets. Answer in the transcripts\' language.\n\n'
+                + joined
+            )
+        else:
+            return jsonify({'error': 'mode must be video or playlist.', 'error_type': 'invalid_input'}), 400
+
+        allowed, used = _consume_summary_quota(license_key)
+        if not allowed:
+            return jsonify({'error': f'Monthly AI summary limit reached ({SUMMARY_MONTHLY_QUOTA}).',
+                            'error_type': 'quota_exceeded'}), 429
+
+        try:
+            summary_text = _gemini_summarize(prompt)
+        except Exception as e:
+            logger.error(f"Gemini error: {type(e).__name__}: {e}")
+            return jsonify({'error': 'The AI service is unavailable right now. Please try again shortly.',
+                            'error_type': 'ai_error'}), 502
+
+        result = {'summary': summary_text, 'mode': mode, 'model': GEMINI_MODEL,
+                  'summaries_used': used, 'summaries_limit': SUMMARY_MONTHLY_QUOTA, 'success': True}
+        cache_set(cache_key, result)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Unexpected error in summarize: {str(e)}")
+        return jsonify({'error': 'An unexpected error occurred.', 'error_type': 'server_error'}), 500
+
 
 # Error handlers
 @app.errorhandler(429)
@@ -1339,5 +1663,5 @@ def internal_error_handler(e):
     }), 500
 
 if __name__ == '__main__':
-    logger.info("Starting TranscriptFlow Backend v3.4")
+    logger.info("Starting TranscriptFlow Backend v3.5")
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
