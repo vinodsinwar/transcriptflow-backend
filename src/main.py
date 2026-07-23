@@ -982,6 +982,23 @@ def _rating_ip_hash():
     return hashlib.sha256(ip.encode()).hexdigest()[:24]
 
 
+@app.route('/api/license/check', methods=['POST'])
+@limiter.limit('10 per minute')
+def license_check():
+    """Lightweight key check for the activation UI: validity + plan + credits."""
+    data = request.get_json() or {}
+    key = (data.get('license_key') or '').strip()
+    if not key or len(key) > 200:
+        return jsonify({'valid': False})
+    if not _validate_license(key):
+        return jsonify({'valid': False})
+    plan = _key_type(key)
+    body = {'valid': True, 'plan': plan}
+    if plan == 'pack':
+        body['credits_remaining'] = credits_remaining(key)
+    return jsonify(body)
+
+
 @app.route('/api/webhooks/dodo', methods=['POST'])
 @limiter.exempt
 def dodo_webhook():
